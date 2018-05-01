@@ -53,62 +53,72 @@ struct ina3221_chip {
 	struct i2c_client *client;
 	struct ina3221_platform_data *pdata;
 	struct mutex mutex;
-	// int shutdown_complete;
-	// int is_suspended;
-	// int mode;
-	// int alert_enabled;
-	// struct notifier_block nb_hot;
-	// struct notifier_block nb_cpufreq;
+
 };
 
-// static int ina3221_to_bus_voltage(unsigned int reading){
-// 	int bus_volt_mv;
-// 	reading()
-//
-// 	return bus_volt_mv;
-// }
+
+static int to_shunt_volt(int val){
+	int volt_uv;
+	volt_uv = sign_extend32(val >> 3, 12) * 40;
+	return volt_uv;
+}
+
+static int to_bus_volt(int val){
+	int volt_mv;
+	volt_mv = sign_extend32(val >> 3, 12) * 8;
+	return volt_mv;
+}
+
+static int show_shunt_resistor(struct ina3221_chip *chip, int channel){
+	int resistor_mo;
+	resistor_mo = chip->pdata->cpdata[channel].shunt_resistor;
+	return resistor_mo;
+}
+
+
+static int shunt_volt_to_current(int volt_uv, int resistor_mo){
+	int current_ma;
+
+	current_ma = DIV_ROUND_CLOSEST(volt_uv, resistor_mo * 1000);
+
+	return current_ma;
+}
+
+static int show_crit_limit(struct ina3221_chip *chip, int channel){
+	int current_ma;
+
+ 	current_ma= chip->pdata->cpdata[channel].crit_conf_limits;
+	return current_ma;
+}
+
+static int show_warn_limit(struct ina3221_chip *chip, int channel){
+	int current_ma;
+
+ 	current_ma= chip->pdata->cpdata[channel].warn_conf_limits;
+	return current_ma;
+}
 
 
 
-static int ina3221_read_value(struct ina3221_chip *chip, int channel, u16 dev_reg, int *val){
-		int ret;
+static int ina3221_read_value(struct ina3221_chip *chip, int channel, u16 dev_reg){
+	int ret;
     struct i2c_client *client = chip->client;
     u16 reg;
     reg = dev_reg + (channel * 2);
+	printk("read from: %u\n",reg);
 
     mutex_lock(&chip->mutex);
-    // read
     ret = i2c_smbus_read_word_data(client, reg);
-		//	error handling
-		if (ret < 0) {
-			dev_err(chip->dev, "Value read on channel %d failed: %d\n", channel, ret);
-			goto exit;
-		}
-
-		*val = ((be16_to_cpu(ret) >> 3) * 8);     //bus voltage
-		// shunt be16_to_cpu >> 3 * 40
-		printk("reading: %d from registor: %u\n", *val, reg);
-
-	//covernsion
-	// if(dev_reg == INA3221_SHUNT_VOL_CHAN1){
-	//
-	//
-	// }
-	//
-	// if(dev_reg == INA3221_BUS_VOL_CHAN1){
-	//
-	//
-	// }
-	//result:   actual    14.5v     210ma
-  //   shunt   4099           reg5
-  //   bus   53304           reg6          -1273
-
+	if (ret < 0) {
+		dev_err(chip->dev, "Value read on channel %d failed: %d\n", channel, ret);
+		goto exit;
+	}
+	printk("read value: %d\n", ret);
 
 exit:
 	mutex_unlock(&chip->mutex);
 	return ret;
 }
-
 
 
 static int ina3221_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec const *chan, int *val, int *val2, long mask){
@@ -123,36 +133,48 @@ static int ina3221_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec cons
         dev_err(dev, "Invalid channel Id %d\n", channel);
         return -EINVAL;
     }
-    if (mask != IIO_CHAN_INFO_PROCESSED) {
-        dev_err(dev, "Invalid mask 0x%08lx\n", mask);
-        return -EINVAL;
-    }
-
     switch(type){
         case IIO_VOLTAGE:
             switch(address){
                 case 0:
                     //read shunt volt
-                    ina3221_read_value(chip, channel, INA3221_SHUNT_VOL_CHAN1, val);
+                    ret = ina3221_read_value(chip, channel, INA3221_SHUNT_VOL_CHAN1);
+					*val = to_shunt_volt(ret);
                     break;
                 case 1:
                     //read bus volt
-                    ina3221_read_value(chip, channel, INA3221_BUS_VOL_CHAN1, val);
+                    ret = ina3221_read_value(chip, channel, INA3221_BUS_VOL_CHAN1);
+					*val = to_bus_volt(ret);
                     break;
             }
             break;
         case IIO_CURRENT:
-            switch(address){
+        	switch(address){
                 case 0:
-                    //read curr crit
-                    ina3221_read_value(chip, channel, INA3221_CRIT_CHAN1, val);
+					ret = ina3221_read_value(chip, channel, INA3221_SHUNT_VOL_CHAN1);
+					ret = to_shunt_volt(ret);
+					*val = shunt_volt_to_current(ret, show_shunt_resistor(chip, channel));
                     break;
                 case 1:
-                    //read warn crit
-                    ina3221_read_value(chip, channel, INA3221_WARN_CHAN1, val);
+					ret = show_shunt_resistor(chip, channel);
+					*val = ret;
                     break;
             }
             break;
+		case IIO_POWER:
+		 	switch(address){
+				case 0:
+					ret = show_crit_limit(chip, channel);
+					*val = ret;
+					printk("limit: %d\n", *val);
+					break;
+				case 1:
+					ret = show_warn_limit(chip, channel);
+					*val = ret;
+					printk("limit: %d\n", *val);
+					break;
+			}
+			break;
         default:
             ret = -EINVAL;
             break;
@@ -163,7 +185,95 @@ static int ina3221_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec cons
         return ret;
 }
 
-#define channel_type(_type, _add, _channel, _name){  \
+static int to_volt_limit(u32 conf_limits, u32 shunt_resistor){
+	int volt_limit_uv;
+	volt_limit_uv = conf_limits * shunt_resistor * 1000 * 1000;
+	volt_limit_uv = DIV_ROUND_CLOSEST(volt_limit_uv, 5) & 0xfff8;
+	return volt_limit_uv;
+
+}
+
+
+// crit warn
+static int ina3221_set_alert_reg(struct ina3221_chip *chip, int channel, u16 dev_reg, int volt_limit_uv){
+	int ret;
+	struct i2c_client *client = chip->client;
+
+	u16 reg;
+	reg = dev_reg + (channel * 2);
+	mutex_lock(&chip->mutex);
+	ret = i2c_smbus_write_word_data(client, reg, cpu_to_be16(volt_limit_uv));
+	if (ret < 0) {
+		dev_err(chip->dev, "Unable to set limit on channel %d failed: %d\n", channel, ret);
+	}
+	mutex_unlock(&chip->mutex);
+	return ret;
+}
+
+
+
+
+
+static int ina3221_set_limits(struct ina3221_chip *chip)
+{
+	struct ina3221_chan_pdata *cpdata;
+	int i, volt_limit_uv;
+	int ret = 0;
+
+	for (i = 0; i < INA3221_NUMBER_OF_CHANNEL; i++) {
+		cpdata = &chip->pdata->cpdata[i];
+
+		if (cpdata->crit_conf_limits != U32_MINUS_1) {
+			volt_limit_uv = to_volt_limit(cpdata->crit_conf_limits, cpdata->shunt_resistor);
+			ret = ina3221_set_alert_reg(chip, i, INA3221_CRIT_CHAN1, volt_limit_uv);
+			if (ret < 0)
+				break;
+		}
+
+		if (cpdata->warn_conf_limits != U32_MINUS_1) {
+			volt_limit_uv = to_volt_limit(cpdata->warn_conf_limits, cpdata->shunt_resistor);
+			ret = ina3221_set_alert_reg(chip, i, INA3221_CRIT_CHAN1, volt_limit_uv);
+			if (ret < 0)
+				break;
+		}
+	}
+	return ret;
+}
+
+
+
+
+static int ina3221_write_raw(struct iio_dev *indio_dev, struct iio_chan_spec const *chan, int *val, int *val2, long mask){
+    struct ina3221_chip *chip = iio_priv(indio_dev);
+    struct device *dev = chip->dev;
+
+    int type = chan->type;
+    int channel = chan->channel;
+    int address = chan->address;
+	struct ina3221_chan_pdata *cpdata = &chip->pdata->cpdata[channel];
+	int volt_limit_uv;
+    int ret = 0;
+
+    if (channel >= 3) {
+        dev_err(dev, "Invalid channel Id %d\n", channel);
+        return -EINVAL;
+    }
+
+	switch(type){
+        case IIO_POWER:
+            switch(address){
+                case 0:
+					volt_limit_uv = to_volt_limit(cpdata->crit_conf_limits, cpdata->shunt_resistor);
+					ret = ina3221_set_alert_reg(chip, channel, INA3221_CRIT_CHAN1, volt_limit_uv);
+                    break;
+                case 1:
+					volt_limit_uv = to_volt_limit(cpdata->warn_conf_limits, cpdata->shunt_resistor);
+					ret = ina3221_set_alert_reg(chip, channel, INA3221_CRIT_CHAN1, volt_limit_uv);
+                    break;
+    return -EINVAL;
+}
+
+#define channel_type(_type, _add, _channel, _name, _mask){ \
     .type = _type, \
     .indexed = 1, \
     .address = _add, \
@@ -173,23 +283,25 @@ static int ina3221_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec cons
 }
 
 #define channel_spec(chan)						\
-    channel_type(IIO_VOLTAGE, 0, chan, "shunt_voltage"),			\
-  	channel_type(IIO_VOLTAGE, 1, chan, "bus_voltage"),			\
-  	channel_type(IIO_CURRENT, 0, chan, "crit_limit"),     \
-    channel_type(IIO_CURRENT, 1, chan, "warn_limit"),   \
-    channel_type(IIO_POWER, 0, chan, "shunt_resistor")
+    channel_type(IIO_VOLTAGE, 0, chan, "shunt"),			\
+  	channel_type(IIO_VOLTAGE, 1, chan, "bus"),			\
+	channel_type(IIO_CURRENT, 0, chan, "current"), \
+	channel_type(IIO_CURRENT, 1, chan, "shunt_resistor"),  \
+  	channel_type(IIO_POWER, 0, chan, "crit_limit"),     \
+    channel_type(IIO_POWER, 1, chan, "warn_limit")
 
 
 static const struct iio_chan_spec ina3221_channels_spec[] = {
   	channel_spec(0),
   	channel_spec(1),
-  	channel_spec(2)
+  	channel_spec(2),
 };
 
 static const struct iio_info ina3221_info = {
-  //	.attrs = &ina3221_groups,
   	.driver_module = THIS_MODULE,
   	.read_raw = &ina3221_read_raw,
+	.write_raw = &ina3221_write_raw,
+
 };
 
 static struct ina3221_platform_data *ina3221_get_platform_data_dt(
@@ -266,7 +378,7 @@ static struct ina3221_platform_data *ina3221_get_platform_data_dt(
 }
 
 
-static int ina3221_probe(struct i2c_client *client,
+static int ina3221_probe (struct i2c_client *client,
 			const struct i2c_device_id *id)
 {
 	struct ina3221_chip *chip;
@@ -295,9 +407,7 @@ static int ina3221_probe(struct i2c_client *client,
 	chip->pdata = pdata;
 	mutex_init(&chip->mutex);
 
-	// chip->mode = TRIGGERED;
-	// chip->shutdown_complete = 0;
-	// chip->is_suspended = 0;
+
 
 	indio_dev->info = &ina3221_info;
 	indio_dev->channels = ina3221_channels_spec;
@@ -320,31 +430,13 @@ static int ina3221_probe(struct i2c_client *client,
 			ret);
 		return ret;
 	}
+	ret = ina3221_set_limits(chip);
+	if (ret < 0) {
+		dev_info(&client->dev, "Not able to set warn and crit limits!\n");
+	}
 
-// 	chip->nb_hot.notifier_call = ina3221_hotplug_notify;
-// 	chip->nb_cpufreq.notifier_call = ina3221_cpufreq_notify;
-// 	register_hotcpu_notifier(&(chip->nb_hot));
-// 	cpufreq_register_notifier(&(chip->nb_cpufreq),
-// 			CPUFREQ_TRANSITION_NOTIFIER);
-//
-// 	ret = __locked_set_crit_warn_limits(chip);
-// 	if (ret < 0) {
-// 		dev_info(&client->dev, "Not able to set warn and crit limits!\n");
-// 		/*Not an error condition, could let the probe continue*/
-// 	}
-//
-// 	/* set ina3221 to power down mode */
-// 	ret = __locked_power_down_ina3221(chip);
-// 	if (ret < 0) {
-// 		dev_err(&client->dev, "INA power down failed: %d\n", ret);
-// 		goto exit_pd;
-// 	}
-// 	return 0;
-//
-// exit_pd:
-// 	unregister_hotcpu_notifier(&(chip->nb_hot));
-// 	cpufreq_unregister_notifier(&(chip->nb_cpufreq),
-// 			CPUFREQ_TRANSITION_NOTIFIER);
+	ret = ina3221_set_limits(chip);
+
 	return ret;
 }
 
